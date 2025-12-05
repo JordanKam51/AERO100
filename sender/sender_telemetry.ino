@@ -4,7 +4,6 @@
 #include <LoRa.h>
 
 
-// ---------- LoRa pins ----------
 #define LORA_SCK   5
 #define LORA_MISO  21
 #define LORA_MOSI  19
@@ -14,12 +13,10 @@
 #define LORA_FREQ  915E6
 
 
-// ---------- I2C pins ----------
 #define I2C_SDA    25
 #define I2C_SCL    26
 
 
-// ---------- MPU6050 (same as your old code) ----------
 const int MPU = 0x68;
 int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
 int AcXcal, AcYcal, AcZcal, GyXcal, GyYcal, GyZcal, tcal;
@@ -60,14 +57,13 @@ void setup() {
 
 
 void loop() {
- // ---------- READ MPU6050 (your original sequence) ----------
+
  Wire.beginTransmission(MPU);
- Wire.write(0x3B);            // starting register for accel data
+ Wire.write(0x3B);           
  Wire.endTransmission(false);
- Wire.requestFrom(MPU, 14, true);  // read 14 bytes
+ Wire.requestFrom(MPU, 14, true);  
 
 
- // calibration offsets (from your code)
  AcXcal = -950;
  AcYcal = -300;
  AcZcal = 0;
@@ -87,14 +83,13 @@ void loop() {
 
 
  tx = Tmp + tcal;
- t  = tx / 340.0 + 36.53;       // °C
- tf = (t * 9.0 / 5.0) + 32.0;   // °F
+ t  = tx / 340.0 + 36.53;       
+ tf = (t * 9.0 / 5.0) + 32.0;   
 
 
- getAngle(AcX, AcY, AcZ);       // compute pitch & roll
+ getAngle(AcX, AcY, AcZ);       
 
 
- // ---------- SEND OVER LoRa ----------
  LoRa.beginPacket();
 
 
@@ -120,7 +115,6 @@ void loop() {
  LoRa.endPacket();
 
 
- // ---------- ALSO PRINT LOCALLY ----------
  Serial.print("Packet #"); Serial.print(counter);
  Serial.print(" | pitch="); Serial.print(pitch, 2);
  Serial.print(" roll=");    Serial.print(roll, 2);
@@ -135,7 +129,7 @@ void loop() {
 
 
  counter++;
- delay(1000);  // ~1 Hz
+ delay(1000);  
 }
 
 
