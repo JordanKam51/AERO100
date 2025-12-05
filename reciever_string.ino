@@ -1,0 +1,49 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+#define LORA_SCK   5
+#define LORA_MISO  21
+#define LORA_MOSI  19
+
+
+#define LORA_SS    27
+#define LORA_RST   33
+#define LORA_DIO0  15
+
+
+#define LORA_FREQ  915E6
+
+
+void setup() {
+ Serial.begin(115200);
+
+
+ SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+ LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+
+ if (!LoRa.begin(LORA_FREQ)) {
+   Serial.println("LoRa init failed");
+   while (1);
+ }
+
+
+ Serial.println("LoRa receiver ready!");
+}
+
+
+void loop() {
+ int packetSize = LoRa.parsePacket();
+ if (packetSize) {
+   Serial.print("Received: ");
+
+
+   while (LoRa.available()) {
+     Serial.print((char)LoRa.read());
+   }
+
+
+   Serial.print(" | RSSI: ");
+   Serial.println(LoRa.packetRssi());
+ }
+}
