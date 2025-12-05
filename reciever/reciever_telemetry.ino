@@ -2,7 +2,6 @@
 #include <LoRa.h>
 
 
-// Same LoRa pins and frequency as sender
 #define LORA_SCK   5
 #define LORA_MISO  21
 #define LORA_MOSI  19
