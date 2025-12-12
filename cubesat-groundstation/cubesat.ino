@@ -1,15 +1,15 @@
+// sender_strict_match.ino
+// ESC-style PWM on GPIO32 (50 Hz, 1000–2000 us)
+// Magnetorquer on GPIO14
+
 #include <Arduino.h>
 #include <Wire.h>
-#include <math.h>
 #include <SPI.h>
 #include <LoRa.h>
-
-#if !defined(ARDUINO_ARCH_ESP32)
-#error "This sketch requires an ESP32 board selected in Tools → Board."
-#endif
+#include <math.h>
 
 // =====================
-// LORA (ORIGINAL PINS)
+// LORA
 // =====================
 #define LORA_SCK   5
 #define LORA_MISO  21
@@ -22,56 +22,68 @@
 // =====================
 // IMU (MPU6050)
 // =====================
-#define I2C_SDA    25
-#define I2C_SCL    26
-const int MPU = 0x68;
+#define I2C_SDA 25
+#define I2C_SCL 26
+#define MPU 0x68
 
 int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
-int AcXcal, AcYcal, AcZcal, GyXcal, GyYcal, GyZcal, tcal;
-double tC, tx, tF, pitch, roll;
+double pitch = 0, roll = 0, tC = 0, tF = 0;
 
 // =====================
 // MAGNETORQUER
 // =====================
-#define MAG_PIN 13
+#define MAG_PIN 14
 bool magOn = false;
 
 // =====================
-// STEPPER (A4988/DRV8825 STEP/DIR)
+// ESC / REACTION WHEEL
 // =====================
-// CHANGE THESE to your wiring. These are safe defaults.
-#define STEPPER_STEP_PIN 32
-#define STEPPER_DIR_PIN  14
-#define STEPPER_EN_PIN   -1   // set to a GPIO if used, else keep -1
+#define RW_PIN 32
+bool rwEnabled = false;
 
-const int      STEPS_EACH_SEC = 200;   // steps per second command
-const uint32_t STEP_EDGE_US   = 800;   // toggles edge timing; smaller=faster
+// PWM parameters (match MicroPython)
+#define ESC_FREQ_HZ     50
+#define ESC_PWM_BITS    16
+#define ESC_PWM_MAX     65535
 
-// Non-blocking stepper driver (toggle step pin edges)
-volatile int stepsRemainingEdges = 0;
-bool stepPinState = LOW;
-uint32_t nextStepUs = 0;
-bool stepperDir = false;
+#define ESC_US_MIN      1000
+#define ESC_US_MAX      2000
+#define ESC_US_IDLE     1000
+#define ESC_US_RUN      1700   // throttle when RW=1 (adjust)
 
 // =====================
 // TIMING
 // =====================
-unsigned long last1HzMs = 0;
+unsigned long lastTx = 0;
 int counter = 0;
 
 // =====================
 // HELPERS
 // =====================
+uint32_t usToDuty(uint16_t us) {
+  // duty = (us / 20000) * 65535
+  return (uint32_t)((((uint32_t)us) * ESC_PWM_MAX) / 20000UL);
+}
+
+void setESCmicroseconds(uint16_t us) {
+  if (us < ESC_US_MIN) us = ESC_US_MIN;
+  if (us > ESC_US_MAX) us = ESC_US_MAX;
+  analogWrite(RW_PIN, usToDuty(us));
+}
+
+void applyOutputs() {
+  digitalWrite(MAG_PIN, magOn ? HIGH : LOW);
+
+  if (rwEnabled) {
+    setESCmicroseconds(ESC_US_RUN);
+  } else {
+    setESCmicroseconds(ESC_US_IDLE);
+  }
+}
+
 void getAngle(int Ax, int Ay, int Az) {
-  double x = Ax;
-  double y = Ay;
-  double z = Az;
-
-  pitch = atan(x / sqrt((y * y) + (z * z)));
-  roll  = atan(y / sqrt((x * x) + (z * z)));
-
-  pitch = pitch * (180.0 / 3.14);
-  roll  = roll  * (180.0 / 3.14);
+  pitch = atan((double)Ax / sqrt((double)Ay * Ay + (double)Az * Az)) * 180.0 / PI;
+  roll  = atan((double)Ay / sqrt((double)Ax * Ax + (double)Az * Az)) * 180.0 / PI;
 }
 
 void sampleIMU() {
@@ -80,163 +92,137 @@ void sampleIMU() {
   Wire.endTransmission(false);
   Wire.requestFrom(MPU, 14, true);
 
-  // Your calibration offsets
-  AcXcal = -950;
-  AcYcal = -300;
-  AcZcal = 0;
-  tcal   = -1600;
-  GyXcal = 480;
-  GyYcal = 170;
-  GyZcal = 210;
+  AcX = (Wire.read() << 8) | Wire.read();
+  AcY = (Wire.read() << 8) | Wire.read();
+  AcZ = (Wire.read() << 8) | Wire.read();
+  Tmp = (Wire.read() << 8) | Wire.read();
+  GyX = (Wire.read() << 8) | Wire.read();
+  GyY = (Wire.read() << 8) | Wire.read();
+  GyZ = (Wire.read() << 8) | Wire.read();
 
-  AcX = Wire.read() << 8 | Wire.read();
-  AcY = Wire.read() << 8 | Wire.read();
-  AcZ = Wire.read() << 8 | Wire.read();
-  Tmp = Wire.read() << 8 | Wire.read();
-  GyX = Wire.read() << 8 | Wire.read();
-  GyY = Wire.read() << 8 | Wire.read();
-  GyZ = Wire.read() << 8 | Wire.read();
-
-  tx = Tmp + tcal;
-  tC = tx / 340.0 + 36.53;
-  tF = (tC * 9.0 / 5.0) + 32.0;
+  tC = (double)Tmp / 340.0 + 36.53;
+  tF = tC * 9.0 / 5.0 + 32.0;
 
   getAngle(AcX, AcY, AcZ);
 }
 
-void startStepperMove(int steps) {
-  // 1 pulse = HIGH then LOW, so 2 edges per step
-  stepsRemainingEdges = steps * 2;
-  stepPinState = LOW;
-  digitalWrite(STEPPER_STEP_PIN, stepPinState);
-  nextStepUs = micros();
-}
-
-void serviceStepper() {
-  if (stepsRemainingEdges <= 0) return;
-
-  uint32_t now = micros();
-  if ((int32_t)(now - nextStepUs) >= 0) {
-    stepPinState = !stepPinState;
-    digitalWrite(STEPPER_STEP_PIN, stepPinState);
-    stepsRemainingEdges--;
-    nextStepUs = now + STEP_EDGE_US;
+static String sanitizeText(const String& in) {
+  String out;
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c >= 32 && c <= 126) out += c;
   }
+  out.trim();
+  return out;
 }
 
-void sendLoRaTelemetry() {
-  int ax = AcX + AcXcal;
-  int ay = AcY + AcYcal;
-  int az = AcZ + AcZcal;
-  int gx = GyX + GyXcal;
-  int gy = GyY + GyYcal;
-  int gz = GyZ + GyZcal;
+// =====================
+// COMMAND RX
+// =====================
+void handleLoRaCommands() {
+  int packetSize = LoRa.parsePacket();
+  if (!packetSize) return;
 
-  // Packet format (easy to parse):
-  // IMU,<ctr>,<pitch>,<roll>,<ax>,<ay>,<az>,<gx>,<gy>,<gz>,<tC>,<tF>,MAG,<0/1>,DIR,<0/1>,STEPS,<N>
-  String packet;
-  packet.reserve(220);
+  String cmd;
+  while (LoRa.available()) cmd += (char)LoRa.read();
+  cmd = sanitizeText(cmd);
 
-  packet += "IMU,";
-  packet += String(counter); packet += ",";
-  packet += String(pitch, 2); packet += ",";
-  packet += String(roll, 2);  packet += ",";
-  packet += String(ax);       packet += ",";
-  packet += String(ay);       packet += ",";
-  packet += String(az);       packet += ",";
-  packet += String(gx);       packet += ",";
-  packet += String(gy);       packet += ",";
-  packet += String(gz);       packet += ",";
-  packet += String(tC, 2);    packet += ",";
-  packet += String(tF, 2);    packet += ",";
-  packet += "MAG,";           packet += (magOn ? "1" : "0"); packet += ",";
-  packet += "DIR,";           packet += (stepperDir ? "1" : "0"); packet += ",";
-  packet += "STEPS,";         packet += String(STEPS_EACH_SEC);
+  if (!cmd.startsWith("CMD:")) return;
+  if (!cmd.endsWith(";")) return;
+
+  if (cmd.indexOf("MAG=1") >= 0) magOn = true;
+  if (cmd.indexOf("MAG=0") >= 0) magOn = false;
+
+  if (cmd.indexOf("RW=1") >= 0) rwEnabled = true;
+  if (cmd.indexOf("RW=0") >= 0) rwEnabled = false;
+
+  applyOutputs();
+
+  Serial.print("RX CMD: ");
+  Serial.println(cmd);
+}
+
+// =====================
+// TELEMETRY
+// =====================
+void sendTelemetry() {
+  String pkt;
+  pkt.reserve(220);
+
+  pkt += "IMU,";
+  pkt += counter; pkt += ",";
+  pkt += pitch; pkt += ",";
+  pkt += roll; pkt += ",";
+  pkt += AcX; pkt += ",";
+  pkt += AcY; pkt += ",";
+  pkt += AcZ; pkt += ",";
+  pkt += GyX; pkt += ",";
+  pkt += GyY; pkt += ",";
+  pkt += GyZ; pkt += ",";
+  pkt += tC; pkt += ",";
+  pkt += tF; pkt += ",";
+  pkt += "MAG,"; pkt += (magOn ? "1" : "0"); pkt += ",";
+  pkt += "RW,";  pkt += (rwEnabled ? "1" : "0");
 
   LoRa.beginPacket();
-  LoRa.print(packet);
+  LoRa.print(pkt);
   LoRa.endPacket();
+  LoRa.receive();
 
-  Serial.println("========== TX ==========");
-  Serial.print("TX packet: ");
-  Serial.println(packet);
-  Serial.println("========================");
+  Serial.println(pkt);
 }
 
+// =====================
+// SETUP
+// =====================
 void setup() {
   Serial.begin(115200);
-  delay(800);
-  Serial.println("SENDER boot: LoRa + IMU + MAG + STEPPER");
+  delay(300);
 
-  // Magnetorquer
   pinMode(MAG_PIN, OUTPUT);
-  digitalWrite(MAG_PIN, LOW);
+  pinMode(RW_PIN, OUTPUT);
 
-  // Stepper pins
-  pinMode(STEPPER_STEP_PIN, OUTPUT);
-  pinMode(STEPPER_DIR_PIN, OUTPUT);
-  digitalWrite(STEPPER_STEP_PIN, LOW);
-  digitalWrite(STEPPER_DIR_PIN, LOW);
+  // ESC PWM setup (ESP32 core 3.x)
+  analogWriteFrequency(RW_PIN, ESC_FREQ_HZ);
+  analogWriteResolution(RW_PIN, ESC_PWM_BITS);
 
-  if (STEPPER_EN_PIN >= 0) {
-    pinMode(STEPPER_EN_PIN, OUTPUT);
-    // many drivers: enable LOW
-    digitalWrite(STEPPER_EN_PIN, LOW);
-  }
+  // Arm ESC
+  setESCmicroseconds(ESC_US_IDLE);
+  delay(3000);   // match MicroPython arming delay
 
-  // I2C + MPU6050
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.beginTransmission(MPU);
   Wire.write(0x6B);
   Wire.write(0);
   Wire.endTransmission(true);
 
-  // LoRa init (original pins)
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
 
-  if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println("LoRa init failed!");
-    while (true) { delay(100); }
-  }
-
-  // Match your other node settings
+  LoRa.begin(LORA_FREQ);
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
   LoRa.enableCrc();
+  LoRa.setPreambleLength(8);
+  LoRa.setTxPower(17);
+  LoRa.receive();
 
-  Serial.println("LoRa ready (SF7, BW125k, CR4/5, SW0x12, CRC ON).");
-
-  last1HzMs = millis();
+  lastTx = millis();
+  Serial.println("Sender ready: ESC PWM on GPIO32, MAG on GPIO14");
 }
 
+// =====================
+// LOOP
+// =====================
 void loop() {
-  serviceStepper();
+  handleLoRaCommands();
 
-  unsigned long nowMs = millis();
-  if (nowMs - last1HzMs >= 1000) {
-    last1HzMs += 1000;
-
-    // 1) Sample IMU
+  if (millis() - lastTx >= 1000) {
+    lastTx += 1000;
     sampleIMU();
-
-    // 2) Toggle magnetorquer
-    magOn = !magOn;
-    digitalWrite(MAG_PIN, magOn ? HIGH : LOW);
-    Serial.print("MAG: "); Serial.println(magOn ? "ON" : "OFF");
-
-    // 3) Stepper move each second
-    stepperDir = !stepperDir;
-    digitalWrite(STEPPER_DIR_PIN, stepperDir ? HIGH : LOW);
-    startStepperMove(STEPS_EACH_SEC);
-    Serial.print("Stepper: DIR="); Serial.print(stepperDir ? 1 : 0);
-    Serial.print(" STEPS="); Serial.println(STEPS_EACH_SEC);
-
-    // 4) Send telemetry over LoRa
-    sendLoRaTelemetry();
-
+    sendTelemetry();
     counter++;
   }
 }
