@@ -1,3 +1,5 @@
+// http://172.20.10.5/capture
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include "esp_camera.h"
