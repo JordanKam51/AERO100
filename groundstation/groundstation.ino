@@ -34,8 +34,8 @@ long   lastRxRSSI = 0;
 // ----------- RX LOG (WPT packets) ----------
 static const int RX_LOG_MAX = 10;
 String rxLog[RX_LOG_MAX];
-int rxLogCount = 0;   // number of valid entries
-int rxLogHead  = 0;   // next write index (ring buffer)
+int rxLogCount = 0;
+int rxLogHead  = 0;
 
 // Forward declarations
 void handle_OnConnect();
@@ -51,20 +51,78 @@ static void addToRxLog(const String& line) {
   if (rxLogCount < RX_LOG_MAX) rxLogCount++;
 }
 
-static bool parseWPT(const String& msg,
-                     String& outLat1, String& outLon1,
-                     String& outLat2, String& outLon2,
-                     String& outLat3, String& outLon3) {
-  // Expected: "WPT:lat1,lon1;lat2,lon2;lat3,lon3;"
-  if (!msg.startsWith("WPT:")) return false;
+// Remove non-printable characters and trim
+static String sanitizeRx(const String& in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    // keep printable ASCII plus newline/carriage return if you want
+    if (c >= 32 && c <= 126) out += c;
+  }
+  out.trim();
+  return out;
+}
 
-  String s = msg;
-  s.remove(0, 4); // remove "WPT:"
+// Find "WPT:" even if garbage is in front
+static String extractWPT(const String& msg) {
+  int idx = msg.indexOf("WPT:");
+  if (idx < 0) return "";
+  return msg.substring(idx);
+}
 
-  // Ensure trailing ';'
+// Parse BOTH formats:
+// A) WPT:lat1,lon1;lat2,lon2;lat3,lon3;
+// B) WPT:lat,lon,alt;
+static bool parseWPTflex(const String& msg,
+                         String& out1a, String& out1b,
+                         String& out2a, String& out2b,
+                         String& out3a, String& out3b) {
+  String w = extractWPT(msg);
+  if (w.length() == 0) return false;
+
+  // remove "WPT:"
+  String s = w;
+  s.remove(0, 4);
+  s.trim();
+
+  // Ensure trailing ';' if it's intended to be terminated
   if (!s.endsWith(";")) s += ";";
 
-  String lat[3], lon[3];
+  // Decide format:
+  // If it has semicolons separating multiple segments with commas inside, we treat as format A.
+  // If it looks like "lat,lon,alt;" (2 commas before first ;) treat as format B.
+  int firstSemi = s.indexOf(';');
+  if (firstSemi < 0) return false;
+
+  String firstSeg = s.substring(0, firstSemi);
+  int commaCount = 0;
+  for (size_t i = 0; i < firstSeg.length(); i++) if (firstSeg[i] == ',') commaCount++;
+
+  if (commaCount >= 2) {
+    // -------- Format B: lat,lon,alt; --------
+    int c1 = firstSeg.indexOf(',');
+    int c2 = firstSeg.indexOf(',', c1 + 1);
+    if (c1 < 0 || c2 < 0) return false;
+
+    String lat = firstSeg.substring(0, c1);     lat.trim();
+    String lon = firstSeg.substring(c1 + 1, c2); lon.trim();
+    String alt = firstSeg.substring(c2 + 1);     alt.trim();
+
+    if (lat == "" || lon == "" || alt == "") return false;
+
+    // Map into your 3 “waypoint” boxes:
+    // WP1 = lat,lon
+    // WP2 = alt, (blank)
+    // WP3 = blank, blank
+    out1a = lat; out1b = lon;
+    out2a = alt; out2b = "";
+    out3a = "";  out3b = "";
+    return true;
+  }
+
+  // -------- Format A: lat1,lon1;lat2,lon2;lat3,lon3; --------
+  String a[3], b[3];
 
   for (int i = 0; i < 3; i++) {
     int semi = s.indexOf(';');
@@ -76,18 +134,15 @@ static bool parseWPT(const String& msg,
     int comma = pair.indexOf(',');
     if (comma < 0) return false;
 
-    lat[i] = pair.substring(0, comma);
-    lon[i] = pair.substring(comma + 1);
+    a[i] = pair.substring(0, comma);     a[i].trim();
+    b[i] = pair.substring(comma + 1);    b[i].trim();
 
-    lat[i].trim();
-    lon[i].trim();
-
-    if (lat[i].length() == 0 || lon[i].length() == 0) return false;
+    if (a[i] == "" || b[i] == "") return false;
   }
 
-  outLat1 = lat[0]; outLon1 = lon[0];
-  outLat2 = lat[1]; outLon2 = lon[1];
-  outLat3 = lat[2]; outLon3 = lon[2];
+  out1a = a[0]; out1b = b[0];
+  out2a = a[1]; out2b = b[1];
+  out3a = a[2]; out3b = b[2];
   return true;
 }
 
@@ -105,9 +160,7 @@ void setup() {
   WiFi.begin(ssid, password);
 
   unsigned long startAttemptTime = millis();
-
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - startAttemptTime < 20000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 20000) {
     Serial.print(".");
     delay(500);
   }
@@ -142,8 +195,8 @@ void setup() {
   Serial.println("LoRa ready (SF7, BW125k, CR4/5, SW0x12, CRC ON).");
 
   // ---------- Web server routes ----------
-  server.on("/", handle_OnConnect);   // dashboard page
-  server.on("/send", handle_Send);    // form submission
+  server.on("/", handle_OnConnect);
+  server.on("/send", handle_Send);
   server.onNotFound(handle_NotFound);
 
   server.begin();
@@ -153,7 +206,6 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // ---------- LoRa receive (non-blocking) ----------
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
     Serial.println("========== RX ==========");
@@ -162,30 +214,31 @@ void loop() {
 
     String rx = "";
     while (LoRa.available()) {
-      char c = (char)LoRa.read();
-      rx += c;
+      rx += (char)LoRa.read();
     }
 
     lastRxRSSI = LoRa.packetRssi();
-    lastRxRaw = rx;
 
-    Serial.print("RX raw: ");
+    // Keep raw (sanitized) for display/debug
+    String clean = sanitizeRx(rx);
+    lastRxRaw = clean;
+
+    Serial.print("RX raw (clean): ");
     Serial.println(lastRxRaw);
     Serial.print("RX RSSI: ");
     Serial.println(lastRxRSSI);
     Serial.println("========================");
 
-    // If it is WPT, parse/store and add to log
-    String tLat1, tLon1, tLat2, tLon2, tLat3, tLon3;
-    if (parseWPT(lastRxRaw, tLat1, tLon1, tLat2, tLon2, tLat3, tLon3)) {
-      rxLat1 = tLat1; rxLon1 = tLon1;
-      rxLat2 = tLat2; rxLon2 = tLon2;
-      rxLat3 = tLat3; rxLon3 = tLon3;
+    String t1a, t1b, t2a, t2b, t3a, t3b;
+    if (parseWPTflex(lastRxRaw, t1a, t1b, t2a, t2b, t3a, t3b)) {
+      rxLat1 = t1a; rxLon1 = t1b;
+      rxLat2 = t2a; rxLon2 = t2b;
+      rxLat3 = t3a; rxLon3 = t3b;
 
-      addToRxLog(lastRxRaw + "  (RSSI " + String(lastRxRSSI) + ")");
-      lastStatus = "Received WPT packet (RSSI " + String(lastRxRSSI) + ")";
+      addToRxLog("WPT: " + lastRxRaw + "  (RSSI " + String(lastRxRSSI) + ")");
+      lastStatus = "Received WPT (RSSI " + String(lastRxRSSI) + ")";
     } else {
-      Serial.println("RX packet was NOT valid WPT");
+      Serial.println("RX packet was NOT valid WPT (after cleaning/extract)");
     }
   }
 }
@@ -197,9 +250,6 @@ void handle_OnConnect() {
 }
 
 void handle_Send() {
-  // Expect:
-  // /send?lat1=...&lon1=...&lat2=...&lon2=...&lat3=...&lon3=...
-
   String lat1 = server.hasArg("lat1") ? server.arg("lat1") : "";
   String lon1 = server.hasArg("lon1") ? server.arg("lon1") : "";
   String lat2 = server.hasArg("lat2") ? server.arg("lat2") : "";
@@ -217,13 +267,10 @@ void handle_Send() {
     return;
   }
 
-  // Store for the page
   lastLat1 = lat1; lastLon1 = lon1;
   lastLat2 = lat2; lastLon2 = lon2;
   lastLat3 = lat3; lastLon3 = lon3;
 
-  // Build LoRa packet with trailing semicolon:
-  // "WPT:lat1,lon1;lat2,lon2;lat3,lon3;"
   String packet = "WPT:" + lat1 + "," + lon1 + ";" +
                           lat2 + "," + lon2 + ";" +
                           lat3 + "," + lon3 + ";";
@@ -248,14 +295,15 @@ void handle_NotFound() {
 // --------- HTML PAGE ----------
 
 String createHTML() {
+  String dash = "-";
+
   String str = "<!DOCTYPE html><html>";
   str += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">";
   str += "<title>Cubesat Command Dashboard</title>";
   str += "<style>";
   str += "body{font-family:Arial,sans-serif;color:#f0f0f0;text-align:center;background:#0b1020;}";
   str += ".card{background:#151a2c;padding:20px;margin:18px auto;max-width:560px;border-radius:12px;box-shadow:0 0 10px rgba(0,0,0,0.4);}";
-  str += "h1{color:#7fd1ff;}";
-  str += "h2{color:#9be7ff;margin-top:0;}";
+  str += "h1{color:#7fd1ff;}h2{color:#9be7ff;margin-top:0;}";
   str += "label{display:block;text-align:left;margin-top:10px;font-size:14px;}";
   str += "input{width:100%;padding:8px;margin-top:4px;border-radius:6px;border:1px solid #333;background:#101425;color:#f0f0f0;}";
   str += "button{margin-top:16px;padding:10px 18px;border-radius:8px;border:none;background:#2f9bff;color:white;font-weight:bold;cursor:pointer;}";
@@ -266,73 +314,46 @@ String createHTML() {
   str += ".valBox{padding:8px;border:1px solid #2a2f45;border-radius:8px;background:#0f1324;text-align:left;}";
   str += ".log{margin-top:12px;padding:10px;border:1px solid #2a2f45;border-radius:10px;background:#0f1324;text-align:left;max-height:180px;overflow:auto;}";
   str += ".logLine{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;font-size:12px;opacity:0.95;margin:6px 0;}";
-  str += ".muted{opacity:0.7;}";
-  str += "</style>";
-  str += "</head>";
+  str += "</style></head><body>";
 
-  str += "<body>";
   str += "<h1>Cubesat Command Dashboard</h1>";
 
-  // ---- PANEL 1: SEND ----
-  str += "<div class=\"card\">";
-  str += "<h2>Send Waypoints (WPT)</h2>";
-  str += "<form action=\"/send\" method=\"GET\">";
+  // SEND PANEL
+  str += "<div class=\"card\"><h2>Send Waypoints (WPT)</h2>";
+  str += "<form action=\"/send\" method=\"GET\"><div class=\"grid\">";
+  str += "<div><label>Waypoint 1 Latitude:<br><input type=\"text\" name=\"lat1\" value=\"" + lastLat1 + "\"></label></div>";
+  str += "<div><label>Waypoint 1 Longitude:<br><input type=\"text\" name=\"lon1\" value=\"" + lastLon1 + "\"></label></div>";
+  str += "<div><label>Waypoint 2 Latitude:<br><input type=\"text\" name=\"lat2\" value=\"" + lastLat2 + "\"></label></div>";
+  str += "<div><label>Waypoint 2 Longitude:<br><input type=\"text\" name=\"lon2\" value=\"" + lastLon2 + "\"></label></div>";
+  str += "<div><label>Waypoint 3 Latitude:<br><input type=\"text\" name=\"lat3\" value=\"" + lastLat3 + "\"></label></div>";
+  str += "<div><label>Waypoint 3 Longitude:<br><input type=\"text\" name=\"lon3\" value=\"" + lastLon3 + "\"></label></div>";
+  str += "</div><button type=\"submit\">Send to Cubesat</button></form>";
+  str += "<div class=\"status\">Last status: " + lastStatus + "</div></div>";
+
+  // RECEIVE PANEL
+  str += "<div class=\"card\"><h2>Received WPT Packets</h2>";
   str += "<div class=\"grid\">";
-
-  str += "<div><label>Waypoint 1 Latitude:<br><input type=\"text\" name=\"lat1\" placeholder=\"e.g. 37.427500\" value=\"" + lastLat1 + "\"></label></div>";
-  str += "<div><label>Waypoint 1 Longitude:<br><input type=\"text\" name=\"lon1\" placeholder=\"e.g. -122.169700\" value=\"" + lastLon1 + "\"></label></div>";
-
-  str += "<div><label>Waypoint 2 Latitude:<br><input type=\"text\" name=\"lat2\" placeholder=\"e.g. 37.428000\" value=\"" + lastLat2 + "\"></label></div>";
-  str += "<div><label>Waypoint 2 Longitude:<br><input type=\"text\" name=\"lon2\" placeholder=\"e.g. -122.170200\" value=\"" + lastLon2 + "\"></label></div>";
-
-  str += "<div><label>Waypoint 3 Latitude:<br><input type=\"text\" name=\"lat3\" placeholder=\"e.g. 37.428500\" value=\"" + lastLat3 + "\"></label></div>";
-  str += "<div><label>Waypoint 3 Longitude:<br><input type=\"text\" name=\"lon3\" placeholder=\"e.g. -122.170800\" value=\"" + lastLon3 + "\"></label></div>";
-
-  str += "</div>";
-  str += "<button type=\"submit\">Send to Cubesat</button>";
-  str += "</form>";
-  str += "<div class=\"status\">Last status: " + lastStatus + "</div>";
+  str += "<div class=\"valBox\"><div class=\"smallLabel\">RX Field 1</div>" + (rxLat1.length()? (rxLat1 + ", " + rxLon1) : dash) + "</div>";
+  str += "<div class=\"valBox\"><div class=\"smallLabel\">RX Field 2</div>" + (rxLat2.length()? (rxLat2 + (rxLon2.length()? (", " + rxLon2):"")) : dash) + "</div>";
+  str += "<div class=\"valBox\"><div class=\"smallLabel\">RX Field 3</div>" + (rxLat3.length()? (rxLat3 + ", " + rxLon3) : dash) + "</div>";
+  str += "<div class=\"valBox\"><div class=\"smallLabel\">RX RSSI</div>" + String(lastRxRSSI) + "</div>";
   str += "</div>";
 
-  // ---- PANEL 2: RECEIVE ----
-  str += "<div class=\"card\">";
-  str += "<h2>Received WPT Packets</h2>";
-
-  // Latest parsed display
-  str += "<div class=\"grid\">";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Latest RX Waypoint 1 (lat, lon)</div>" +
-         (rxLat1.length() ? (rxLat1 + ", " + rxLon1) : String("<span class='muted'>—</span>")) + "</div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Latest RX Waypoint 2 (lat, lon)</div>" +
-         (rxLat2.length() ? (rxLat2 + ", " + rxLon2) : String("<span class='muted'>—</span>")) + "</div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Latest RX Waypoint 3 (lat, lon)</div>" +
-         (rxLat3.length() ? (rxLat3 + ", " + rxLon3) : String("<span class='muted'>—</span>")) + "</div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Latest RX RSSI</div>" + String(lastRxRSSI) + "</div>";
-  str += "</div>";
-
-  // Log of all WPT packets received
   str += "<div class=\"smallLabel\" style=\"margin-top:12px;\">WPT Receive Log (most recent first)</div>";
   str += "<div class=\"log\">";
-
   if (rxLogCount == 0) {
-    str += "<div class=\"logLine muted\">No WPT packets received yet.</div>";
+    str += "<div class=\"logLine\">No WPT packets received yet.</div>";
   } else {
     for (int i = 0; i < rxLogCount; i++) {
       int idx = (rxLogHead - 1 - i);
       while (idx < 0) idx += RX_LOG_MAX;
-      str += "<div class=\"logLine\">";
-      str += rxLog[idx];
-      str += "</div>";
+      str += "<div class=\"logLine\">" + rxLog[idx] + "</div>";
     }
   }
-
-  str += "</div>"; // log
-
-  // Raw last RX (debug)
-  str += "<div class=\"status\" style=\"color:#ffd48a;\">Last RX raw: ";
-  str += (lastRxRaw.length() ? lastRxRaw : String("None"));
   str += "</div>";
 
-  str += "</div>"; // receive card
+  str += "<div class=\"status\" style=\"color:#ffd48a;\">Last RX raw: " + (lastRxRaw.length()? lastRxRaw : String("None")) + "</div>";
+  str += "</div>";
 
   str += "</body></html>";
   return str;
