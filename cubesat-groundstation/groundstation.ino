@@ -1,13 +1,16 @@
-#include <WiFi.h>
-#include <WebServer.h>
+// sender_strict_match.ino
+// ESC-style PWM on GPIO32 (50 Hz, 1000–2000 us)
+// Magnetorquer on GPIO14
+
+#include <Arduino.h>
+#include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <math.h>
 
-// ---------- WiFi ----------
-const char* ssid     = "JordyKam";
-const char* password = "PirateKingLuffy#2451";
-
-// ---------- LoRa pins (ORIGINAL) ----------
+// =====================
+// LORA
+// =====================
 #define LORA_SCK   5
 #define LORA_MISO  21
 #define LORA_MOSI  19
@@ -16,281 +19,210 @@ const char* password = "PirateKingLuffy#2451";
 #define LORA_DIO0  15
 #define LORA_FREQ  915E6
 
-WebServer server(80);
+// =====================
+// IMU (MPU6050)
+// =====================
+#define I2C_SDA 25
+#define I2C_SCL 26
+#define MPU 0x68
 
-// ----------- LAST RECEIVED (parsed) ----------
-String lastRxRaw = "";
-long   lastRxRSSI = 0;
-unsigned long lastRxMs = 0;
+int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
+double pitch = 0, roll = 0, tC = 0, tF = 0;
 
-// Parsed telemetry fields
-String f_ctr = "-";
-String f_pitch = "-";
-String f_roll = "-";
-String f_ax = "-";
-String f_ay = "-";
-String f_az = "-";
-String f_gx = "-";
-String f_gy = "-";
-String f_gz = "-";
-String f_tC = "-";
-String f_tF = "-";
-String f_mag = "-";
-String f_dir = "-";
-String f_steps = "-";
+// =====================
+// MAGNETORQUER
+// =====================
+#define MAG_PIN 14
+bool magOn = false;
 
-// RX log
-static const int RX_LOG_MAX = 12;
-String rxLog[RX_LOG_MAX];
-int rxLogCount = 0;
-int rxLogHead  = 0;
+// =====================
+// ESC / REACTION WHEEL
+// =====================
+#define RW_PIN 32
+bool rwEnabled = false;
 
-void handle_OnConnect();
-void handle_NotFound();
-String createHTML();
+// PWM parameters (match MicroPython)
+#define ESC_FREQ_HZ     50
+#define ESC_PWM_BITS    16
+#define ESC_PWM_MAX     65535
 
-// ----------------- helpers -----------------
-static void addToRxLog(const String& line) {
-  rxLog[rxLogHead] = line;
-  rxLogHead = (rxLogHead + 1) % RX_LOG_MAX;
-  if (rxLogCount < RX_LOG_MAX) rxLogCount++;
+#define ESC_US_MIN      1000
+#define ESC_US_MAX      2000
+#define ESC_US_IDLE     1000
+#define ESC_US_RUN      1700   // throttle when RW=1 (adjust)
+
+// =====================
+// TIMING
+// =====================
+unsigned long lastTx = 0;
+int counter = 0;
+
+// =====================
+// HELPERS
+// =====================
+uint32_t usToDuty(uint16_t us) {
+  // duty = (us / 20000) * 65535
+  return (uint32_t)((((uint32_t)us) * ESC_PWM_MAX) / 20000UL);
 }
 
-static String sanitizeRx(const String& in) {
+void setESCmicroseconds(uint16_t us) {
+  if (us < ESC_US_MIN) us = ESC_US_MIN;
+  if (us > ESC_US_MAX) us = ESC_US_MAX;
+  analogWrite(RW_PIN, usToDuty(us));
+}
+
+void applyOutputs() {
+  digitalWrite(MAG_PIN, magOn ? HIGH : LOW);
+
+  if (rwEnabled) {
+    setESCmicroseconds(ESC_US_RUN);
+  } else {
+    setESCmicroseconds(ESC_US_IDLE);
+  }
+}
+
+void getAngle(int Ax, int Ay, int Az) {
+  pitch = atan((double)Ax / sqrt((double)Ay * Ay + (double)Az * Az)) * 180.0 / PI;
+  roll  = atan((double)Ay / sqrt((double)Ax * Ax + (double)Az * Az)) * 180.0 / PI;
+}
+
+void sampleIMU() {
+  Wire.beginTransmission(MPU);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU, 14, true);
+
+  AcX = (Wire.read() << 8) | Wire.read();
+  AcY = (Wire.read() << 8) | Wire.read();
+  AcZ = (Wire.read() << 8) | Wire.read();
+  Tmp = (Wire.read() << 8) | Wire.read();
+  GyX = (Wire.read() << 8) | Wire.read();
+  GyY = (Wire.read() << 8) | Wire.read();
+  GyZ = (Wire.read() << 8) | Wire.read();
+
+  tC = (double)Tmp / 340.0 + 36.53;
+  tF = tC * 9.0 / 5.0 + 32.0;
+
+  getAngle(AcX, AcY, AcZ);
+}
+
+static String sanitizeText(const String& in) {
   String out;
-  out.reserve(in.length());
   for (size_t i = 0; i < in.length(); i++) {
     char c = in[i];
-    if (c >= 32 && c <= 126) out += c;  // printable ASCII only
+    if (c >= 32 && c <= 126) out += c;
   }
   out.trim();
   return out;
 }
 
-// parse: IMU,<ctr>,<pitch>,<roll>,<ax>,<ay>,<az>,<gx>,<gy>,<gz>,<tC>,<tF>,MAG,<0/1>,DIR,<0/1>,STEPS,<N>
-static bool parseTelemetry(const String& msg) {
-  if (!msg.startsWith("IMU,")) return false;
+// =====================
+// COMMAND RX
+// =====================
+void handleLoRaCommands() {
+  int packetSize = LoRa.parsePacket();
+  if (!packetSize) return;
 
-  // tokenize by commas (simple)
-  String toks[40];
-  int nt = 0;
+  String cmd;
+  while (LoRa.available()) cmd += (char)LoRa.read();
+  cmd = sanitizeText(cmd);
 
-  int start = 0;
-  while (nt < 40) {
-    int comma = msg.indexOf(',', start);
-    if (comma < 0) {
-      toks[nt++] = msg.substring(start);
-      break;
-    } else {
-      toks[nt++] = msg.substring(start, comma);
-      start = comma + 1;
-    }
-  }
+  if (!cmd.startsWith("CMD:")) return;
+  if (!cmd.endsWith(";")) return;
 
-  // expected minimum tokens:
-  // 0 IMU
-  // 1 ctr
-  // 2 pitch
-  // 3 roll
-  // 4 ax
-  // 5 ay
-  // 6 az
-  // 7 gx
-  // 8 gy
-  // 9 gz
-  // 10 tC
-  // 11 tF
-  // 12 MAG
-  // 13 0/1
-  // 14 DIR
-  // 15 0/1
-  // 16 STEPS
-  // 17 N
-  if (nt < 18) return false;
-  if (toks[12] != "MAG" || toks[14] != "DIR" || toks[16] != "STEPS") return false;
+  if (cmd.indexOf("MAG=1") >= 0) magOn = true;
+  if (cmd.indexOf("MAG=0") >= 0) magOn = false;
 
-  f_ctr   = toks[1];
-  f_pitch = toks[2];
-  f_roll  = toks[3];
-  f_ax    = toks[4];
-  f_ay    = toks[5];
-  f_az    = toks[6];
-  f_gx    = toks[7];
-  f_gy    = toks[8];
-  f_gz    = toks[9];
-  f_tC    = toks[10];
-  f_tF    = toks[11];
-  f_mag   = (toks[13] == "1") ? "ON" : "OFF";
-  f_dir   = (toks[15] == "1") ? "1" : "0";
-  f_steps = toks[17];
+  if (cmd.indexOf("RW=1") >= 0) rwEnabled = true;
+  if (cmd.indexOf("RW=0") >= 0) rwEnabled = false;
 
-  return true;
+  applyOutputs();
+
+  Serial.print("RX CMD: ");
+  Serial.println(cmd);
 }
 
-// ----------------- setup/loop -----------------
+// =====================
+// TELEMETRY
+// =====================
+void sendTelemetry() {
+  String pkt;
+  pkt.reserve(220);
+
+  pkt += "IMU,";
+  pkt += counter; pkt += ",";
+  pkt += pitch; pkt += ",";
+  pkt += roll; pkt += ",";
+  pkt += AcX; pkt += ",";
+  pkt += AcY; pkt += ",";
+  pkt += AcZ; pkt += ",";
+  pkt += GyX; pkt += ",";
+  pkt += GyY; pkt += ",";
+  pkt += GyZ; pkt += ",";
+  pkt += tC; pkt += ",";
+  pkt += tF; pkt += ",";
+  pkt += "MAG,"; pkt += (magOn ? "1" : "0"); pkt += ",";
+  pkt += "RW,";  pkt += (rwEnabled ? "1" : "0");
+
+  LoRa.beginPacket();
+  LoRa.print(pkt);
+  LoRa.endPacket();
+  LoRa.receive();
+
+  Serial.println(pkt);
+}
+
+// =====================
+// SETUP
+// =====================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(300);
 
-  Serial.println();
-  Serial.println("Connecting to:");
-  Serial.println(ssid);
+  pinMode(MAG_PIN, OUTPUT);
+  pinMode(RW_PIN, OUTPUT);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  // ESC PWM setup (ESP32 core 3.x)
+  analogWriteFrequency(RW_PIN, ESC_FREQ_HZ);
+  analogWriteResolution(RW_PIN, ESC_PWM_BITS);
 
-  unsigned long startAttemptTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 20000) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println();
+  // Arm ESC
+  setESCmicroseconds(ESC_US_IDLE);
+  delay(3000);   // match MicroPython arming delay
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.print("Failed to connect. WiFi.status() = ");
-    Serial.println(WiFi.status());
-    while (true) { delay(1000); }
-  }
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
 
-  Serial.println("WiFi connected..!");
-  Serial.print("Got IP: ");
-  Serial.println(WiFi.localIP());
-
-  // ---------- LoRa init ----------
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
 
-  if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println("LoRa init failed!");
-    while (true) { delay(100); }
-  }
-
+  LoRa.begin(LORA_FREQ);
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
   LoRa.enableCrc();
+  LoRa.setPreambleLength(8);
+  LoRa.setTxPower(17);
+  LoRa.receive();
 
-  Serial.println("LoRa ready (SF7, BW125k, CR4/5, SW0x12, CRC ON).");
-
-  // ---------- Web server routes ----------
-  server.on("/", handle_OnConnect);
-  server.onNotFound(handle_NotFound);
-
-  server.begin();
-  Serial.println("HTTP server started");
+  lastTx = millis();
+  Serial.println("Sender ready: ESC PWM on GPIO32, MAG on GPIO14");
 }
 
+// =====================
+// LOOP
+// =====================
 void loop() {
-  server.handleClient();
+  handleLoRaCommands();
 
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    Serial.println("========== RX ==========");
-    Serial.print("RX packet size: ");
-    Serial.println(packetSize);
-
-    String rx = "";
-    while (LoRa.available()) rx += (char)LoRa.read();
-
-    lastRxRSSI = LoRa.packetRssi();
-    lastRxRaw  = sanitizeRx(rx);
-    lastRxMs   = millis();
-
-    Serial.print("RX raw (clean): ");
-    Serial.println(lastRxRaw);
-    Serial.print("RX RSSI: ");
-    Serial.println(lastRxRSSI);
-    Serial.println("========================");
-
-    bool ok = parseTelemetry(lastRxRaw);
-    if (ok) {
-      addToRxLog(lastRxRaw + "  (RSSI " + String(lastRxRSSI) + ")");
-      Serial.println("Parsed telemetry OK");
-    } else {
-      addToRxLog("UNPARSED: " + lastRxRaw + "  (RSSI " + String(lastRxRSSI) + ")");
-      Serial.println("RX packet was NOT valid telemetry");
-    }
+  if (millis() - lastTx >= 1000) {
+    lastTx += 1000;
+    sampleIMU();
+    sendTelemetry();
+    counter++;
   }
-}
-
-// --------- HANDLERS ----------
-void handle_OnConnect() {
-  server.send(200, "text/html", createHTML());
-}
-
-void handle_NotFound() {
-  server.send(404, "text/plain", "Not found");
-}
-
-// --------- HTML PAGE ----------
-String createHTML() {
-  String str = "<!DOCTYPE html><html>";
-  str += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">";
-  str += "<meta http-equiv=\"refresh\" content=\"2\">"; // auto-refresh every 2s
-  str += "<title>Telemetry Dashboard</title>";
-  str += "<style>";
-  str += "body{font-family:Arial,sans-serif;color:#f0f0f0;text-align:center;background:#0b1020;}";
-  str += ".card{background:#151a2c;padding:20px;margin:18px auto;max-width:860px;border-radius:12px;box-shadow:0 0 10px rgba(0,0,0,0.4);}";
-  str += "h1{color:#7fd1ff;}h2{color:#9be7ff;margin-top:0;}";
-  str += ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}";
-  str += ".smallLabel{font-size:12px;opacity:0.9;text-align:left;}";
-  str += ".valBox{padding:10px;border:1px solid #2a2f45;border-radius:10px;background:#0f1324;text-align:left;}";
-  str += ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,\"Liberation Mono\",\"Courier New\",monospace;}";
-  str += ".status{margin-top:12px;font-size:13px;color:#b0ffc4;word-wrap:break-word;text-align:left;}";
-  str += ".log{margin-top:12px;padding:10px;border:1px solid #2a2f45;border-radius:10px;background:#0f1324;text-align:left;max-height:220px;overflow:auto;}";
-  str += ".logLine{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,\"Liberation Mono\",\"Courier New\",monospace;font-size:12px;opacity:0.95;margin:6px 0;}";
-  str += "</style></head><body>";
-
-  str += "<h1>Cubesat Telemetry Dashboard</h1>";
-
-  // Panel: Latest parsed telemetry
-  str += "<div class=\"card\"><h2>Latest Telemetry</h2>";
-  str += "<div class=\"grid\">";
-
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Counter</div><div class=\"mono\">" + f_ctr + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Pitch (deg)</div><div class=\"mono\">" + f_pitch + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Roll (deg)</div><div class=\"mono\">" + f_roll + "</div></div>";
-
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">AcX</div><div class=\"mono\">" + f_ax + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">AcY</div><div class=\"mono\">" + f_ay + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">AcZ</div><div class=\"mono\">" + f_az + "</div></div>";
-
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">GyX</div><div class=\"mono\">" + f_gx + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">GyY</div><div class=\"mono\">" + f_gy + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">GyZ</div><div class=\"mono\">" + f_gz + "</div></div>";
-
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Temp (C)</div><div class=\"mono\">" + f_tC + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Temp (F)</div><div class=\"mono\">" + f_tF + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Magnetorquer</div><div class=\"mono\">" + f_mag + "</div></div>";
-
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Stepper DIR</div><div class=\"mono\">" + f_dir + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">Stepper Steps Cmd</div><div class=\"mono\">" + f_steps + "</div></div>";
-  str += "<div class=\"valBox\"><div class=\"smallLabel\">RX RSSI</div><div class=\"mono\">" + String(lastRxRSSI) + "</div></div>";
-
-  str += "</div>"; // grid
-
-  unsigned long age = (lastRxMs == 0) ? 0 : (millis() - lastRxMs);
-  str += "<div class=\"status\">Last RX age: <span class=\"mono\">" + String(age) + " ms</span></div>";
-  str += "<div class=\"status\" style=\"color:#ffd48a;\">Last RX raw: <span class=\"mono\">" + (lastRxRaw.length() ? lastRxRaw : String("None")) + "</span></div>";
-  str += "</div>";
-
-  // Panel: log
-  str += "<div class=\"card\"><h2>Receive Log</h2>";
-  str += "<div class=\"log\">";
-
-  if (rxLogCount == 0) {
-    str += "<div class=\"logLine\">No packets received yet.</div>";
-  } else {
-    for (int i = 0; i < rxLogCount; i++) {
-      int idx = (rxLogHead - 1 - i);
-      while (idx < 0) idx += RX_LOG_MAX;
-      str += "<div class=\"logLine\">" + rxLog[idx] + "</div>";
-    }
-  }
-
-  str += "</div></div>";
-
-  str += "</body></html>";
-  return str;
 }
